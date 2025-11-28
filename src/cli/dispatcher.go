@@ -9,7 +9,9 @@ import (
 	"strconv"
 	"strings"
 
+	"softwaredesign/src/editor"
 	"softwaredesign/src/logging"
+	"softwaredesign/src/statistics"
 	"softwaredesign/src/workspace"
 )
 
@@ -114,11 +116,13 @@ func (d *Dispatcher) execute(raw string) (bool, error) {
 			return false, errors.New("用法: save [file|all]")
 		}
 	case "init":
-		if len(args) == 0 {
-			return false, errors.New("用法: init <file> [with-log]")
+		if len(args) < 2 {
+			return false, errors.New("用法: init <text|xml> <file> [with-log]")
 		}
-		withLog := len(args) > 1 && args[1] == "with-log"
-		ed, err := d.ws.Init(args[0], withLog)
+		kind := strings.ToLower(args[0])
+		fileArg := args[1]
+		withLog := len(args) > 2 && args[2] == "with-log"
+		ed, err := d.ws.Init(kind, fileArg, withLog)
 		if err != nil {
 			return false, err
 		}
@@ -184,14 +188,14 @@ func (d *Dispatcher) execute(raw string) (bool, error) {
 		if len(args) != 1 {
 			return false, errors.New("用法: append \"text\"")
 		}
-		ed, err := d.ws.ActiveEditor()
+		doc, filePath, err := d.requireTextDocument()
 		if err != nil {
 			return false, err
 		}
-		if err := ed.Append(args[0]); err != nil {
+		if err := doc.Append(args[0]); err != nil {
 			return false, err
 		}
-		targetFile = ed.Path()
+		targetFile = filePath
 		d.console.Println("已追加")
 	case "insert":
 		if len(args) != 2 {
@@ -201,14 +205,14 @@ func (d *Dispatcher) execute(raw string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		ed, err := d.ws.ActiveEditor()
+		doc, filePath, err := d.requireTextDocument()
 		if err != nil {
 			return false, err
 		}
-		if err := ed.Insert(line, col, args[1]); err != nil {
+		if err := doc.Insert(line, col, args[1]); err != nil {
 			return false, err
 		}
-		targetFile = ed.Path()
+		targetFile = filePath
 		d.console.Println("已插入")
 	case "delete":
 		if len(args) != 2 {
@@ -222,14 +226,14 @@ func (d *Dispatcher) execute(raw string) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("长度无效: %s", args[1])
 		}
-		ed, err := d.ws.ActiveEditor()
+		doc, filePath, err := d.requireTextDocument()
 		if err != nil {
 			return false, err
 		}
-		if err := ed.Delete(line, col, length); err != nil {
+		if err := doc.Delete(line, col, length); err != nil {
 			return false, err
 		}
-		targetFile = ed.Path()
+		targetFile = filePath
 		d.console.Println("已删除")
 	case "replace":
 		if len(args) != 3 {
@@ -243,21 +247,21 @@ func (d *Dispatcher) execute(raw string) (bool, error) {
 		if err != nil {
 			return false, fmt.Errorf("长度无效: %s", args[1])
 		}
-		ed, err := d.ws.ActiveEditor()
+		doc, filePath, err := d.requireTextDocument()
 		if err != nil {
 			return false, err
 		}
-		if err := ed.Replace(line, col, length, args[2]); err != nil {
+		if err := doc.Replace(line, col, length, args[2]); err != nil {
 			return false, err
 		}
-		targetFile = ed.Path()
+		targetFile = filePath
 		d.console.Println("已替换")
 	case "show":
-		ed, err := d.ws.ActiveEditor()
+		doc, filePath, err := d.requireTextDocument()
 		if err != nil {
 			return false, err
 		}
-		targetFile = ed.Path()
+		targetFile = filePath
 		displayStart := 1
 		start := 1
 		end := 0
@@ -280,13 +284,127 @@ func (d *Dispatcher) execute(raw string) (bool, error) {
 		} else {
 			return false, errors.New("用法: show [start:end]")
 		}
-		lines, err := ed.Show(start, end)
+		lines, err := doc.Show(start, end)
 		if err != nil {
 			return false, err
 		}
 		for i, line := range lines {
 			d.console.Println(fmt.Sprintf("%d: %s", displayStart+i, line))
 		}
+	case "insert-before":
+		if len(args) < 3 || len(args) > 4 {
+			return false, errors.New("用法: insert-before <tag> <newId> <targetId> [\"text\"]")
+		}
+		doc, filePath, err := d.requireXMLDocument("")
+		if err != nil {
+			return false, err
+		}
+		textArg := optionalText(len(args) == 4, args[3])
+		if err := doc.InsertBefore(args[0], args[1], args[2], textArg); err != nil {
+			return false, err
+		}
+		targetFile = filePath
+		d.console.Println("已插入元素")
+	case "append-child":
+		if len(args) < 3 || len(args) > 4 {
+			return false, errors.New("用法: append-child <tag> <newId> <parentId> [\"text\"]")
+		}
+		doc, filePath, err := d.requireXMLDocument("")
+		if err != nil {
+			return false, err
+		}
+		textArg := optionalText(len(args) == 4, args[3])
+		if err := doc.AppendChild(args[0], args[1], args[2], textArg); err != nil {
+			return false, err
+		}
+		targetFile = filePath
+		d.console.Println("已追加子元素")
+	case "edit-id":
+		if len(args) != 2 {
+			return false, errors.New("用法: edit-id <oldId> <newId>")
+		}
+		doc, filePath, err := d.requireXMLDocument("")
+		if err != nil {
+			return false, err
+		}
+		if err := doc.EditID(args[0], args[1]); err != nil {
+			return false, err
+		}
+		targetFile = filePath
+		d.console.Println("已修改元素 ID")
+	case "edit-text":
+		if len(args) != 2 {
+			return false, errors.New("用法: edit-text <elementId> \"text\"")
+		}
+		doc, filePath, err := d.requireXMLDocument("")
+		if err != nil {
+			return false, err
+		}
+		if err := doc.EditText(args[0], args[1]); err != nil {
+			return false, err
+		}
+		targetFile = filePath
+		d.console.Println("已更新元素文本")
+	case "delete-element":
+		if len(args) != 1 {
+			return false, errors.New("用法: delete-element <elementId>")
+		}
+		doc, filePath, err := d.requireXMLDocument("")
+		if err != nil {
+			return false, err
+		}
+		if err := doc.DeleteElement(args[0]); err != nil {
+			return false, err
+		}
+		targetFile = filePath
+		d.console.Println("已删除元素")
+	case "xml-tree":
+		if len(args) > 1 {
+			return false, errors.New("用法: xml-tree [file]")
+		}
+		var fileArg string
+		if len(args) == 1 {
+			fileArg = args[0]
+		}
+		doc, filePath, err := d.requireXMLDocument(fileArg)
+		if err != nil {
+			return false, err
+		}
+		targetFile = filePath
+		tree := doc.TreeString()
+		if tree == "" {
+			d.console.Println("(空文档)")
+		} else {
+			d.console.Println(tree)
+		}
+	case "spell-check":
+		if len(args) > 1 {
+			return false, errors.New("用法: spell-check [file]")
+		}
+		var (
+			fileArg   string
+			resolved  string
+			lookupErr error
+		)
+		if len(args) == 1 {
+			fileArg = args[0]
+			if ed, err := d.ws.EditorByPath(fileArg); err == nil {
+				resolved = ed.Path()
+			} else {
+				lookupErr = err
+			}
+		} else if ed, err := d.ws.ActiveEditor(); err == nil {
+			resolved = ed.Path()
+		}
+		if lookupErr != nil {
+			return false, lookupErr
+		}
+		result, err := d.ws.SpellCheck(fileArg)
+		if err != nil {
+			return false, err
+		}
+		targetFile = resolved
+		d.console.Println(result)
 	case "log-on":
 		fileArg, err := d.resolveFileArg(args)
 		if err != nil {
@@ -361,6 +479,7 @@ func (d *Dispatcher) printEditors() {
 		if info.Modified {
 			line += " [modified]"
 		}
+		line += fmt.Sprintf(" (%s)", statistics.FormatDuration(info.Duration))
 		d.console.Println(line)
 	}
 }
@@ -386,6 +505,46 @@ func (d *Dispatcher) handleExit() error {
 	}
 	d.console.Println("已退出并保存工作区状态")
 	return nil
+}
+
+func (d *Dispatcher) requireTextDocument() (editor.TextDocument, string, error) {
+	ed, err := d.ws.ActiveEditor()
+	if err != nil {
+		return nil, "", err
+	}
+	doc, ok := ed.(editor.TextDocument)
+	if !ok {
+		return nil, "", errors.New("当前文件不支持文本命令")
+	}
+	return doc, ed.Path(), nil
+}
+
+func (d *Dispatcher) requireXMLDocument(arg string) (editor.XMLTreeEditor, string, error) {
+	var (
+		ed  editor.Editor
+		err error
+	)
+	if arg == "" {
+		ed, err = d.ws.ActiveEditor()
+	} else {
+		ed, err = d.ws.EditorByPath(arg)
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	doc, ok := ed.(editor.XMLTreeEditor)
+	if !ok {
+		return nil, "", errors.New("目标文件不是 XML 编辑器")
+	}
+	return doc, ed.Path(), nil
+}
+
+func optionalText(argPresent bool, value string) *string {
+	if !argPresent {
+		return nil
+	}
+	text := value
+	return &text
 }
 
 func tokenize(line string) ([]string, error) {

@@ -37,6 +37,11 @@ func (e *TextEditor) Name() string {
 	return filepath.Base(e.path)
 }
 
+// Type returns the editor kind.
+func (e *TextEditor) Type() Type {
+	return TypeText
+}
+
 // Lines returns a copy of editor lines.
 func (e *TextEditor) Lines() []string {
 	return cloneLines(e.lines)
@@ -196,6 +201,11 @@ func cloneLines(src []string) []string {
 	dst := make([]string, len(src))
 	copy(dst, src)
 	return dst
+}
+
+// Content returns the serialized text data.
+func (e *TextEditor) Content() (string, error) {
+	return strings.Join(e.lines, "\n"), nil
 }
 
 func splitWithKeep(text string) []string {

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"softwaredesign/src/editor"
 	"softwaredesign/src/events"
 	"softwaredesign/src/logging"
 	"softwaredesign/src/workspace"
@@ -25,7 +26,11 @@ func TestWorkspaceLoadSaveCycle(t *testing.T) {
 	if !ed.IsModified() {
 		t.Fatalf("new file should be marked modified")
 	}
-	if err := ed.Append("hello"); err != nil {
+	doc, ok := ed.(editor.TextDocument)
+	if !ok {
+		t.Fatalf("expected text document")
+	}
+	if err := doc.Append("hello"); err != nil {
 		t.Fatalf("append failed: %v", err)
 	}
 	if err := ws.Save(""); err != nil {
@@ -64,16 +69,28 @@ func TestWorkspaceMultipleFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load file1 failed: %v", err)
 	}
-	ed1.Append("content1")
+	doc1, ok := ed1.(editor.TextDocument)
+	if !ok {
+		t.Fatalf("expected text document for file1")
+	}
+	if err := doc1.Append("content1"); err != nil {
+		t.Fatalf("append file1 failed: %v", err)
+	}
 
 	ed2, err := ws.Load(file2)
 	if err != nil {
 		t.Fatalf("load file2 failed: %v", err)
 	}
-	ed2.Append("content2")
+	doc2, ok := ed2.(editor.TextDocument)
+	if !ok {
+		t.Fatalf("expected text document for file2")
+	}
+	if err := doc2.Append("content2"); err != nil {
+		t.Fatalf("append file2 failed: %v", err)
+	}
 
 	active2, _ := ws.ActiveEditor()
-	if active2 != ed2 {
+	if active2 == nil || active2.Path() != ed2.Path() {
 		t.Fatalf("active editor should be file2")
 	}
 
@@ -81,7 +98,7 @@ func TestWorkspaceMultipleFiles(t *testing.T) {
 		t.Fatalf("edit file1 failed: %v", err)
 	}
 	active1, _ := ws.ActiveEditor()
-	if active1 != ed1 {
+	if active1 == nil || active1.Path() != ed1.Path() {
 		t.Fatalf("active editor should be file1 after edit")
 	}
 }
@@ -103,9 +120,7 @@ func TestWorkspaceClose(t *testing.T) {
 	if err := ws.Close(""); err != nil {
 		t.Fatalf("close failed: %v", err)
 	}
-	activeAfter, _ := ws.ActiveEditor()
-	if activeAfter != nil {
+	if _, err := ws.ActiveEditor(); err == nil {
 		t.Fatalf("active editor should be nil after close")
 	}
 }
-

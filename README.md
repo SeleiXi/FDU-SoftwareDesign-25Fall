@@ -1,48 +1,101 @@
-## 文本工作区 CLI
+# Lab2：基于命令行的多文件编辑器
 
-用Go语言的1.22.5版本完成本次Lab，符合 Lab1 要求的命令行文本编辑器工作区。它管理多个缓冲区，持久化工作区状态，提供按文件日志记录等所有要求的功能
+基于 Go 1.22.5，在 Lab1 的文本工作区基础上扩展 XML 编辑、会话时长统计与拼写检查三大模块，同时保留 Lab1 的全部 18 条命令并补充 9 条新/改命令。
 
-### 架构概览
-- **CLI (`internal/cli`)**: 命令解析器/分发器以及控制台提示器。应用解释器 + 外观模式思想，将输入处理与业务逻辑分离。
-- **工作区 (`internal/workspace`)**: 协调编辑器、状态持久化（通过 `StateKeeper` 实现备忘录模式）、观察者（发布事件）和依赖协调。依赖接口（`SaveDecider`）实现防御性设计。
-- **编辑器 (`internal/editor`)**: 基于行存储的文本缓冲区，编辑命令和撤销/重做栈（命令模式配合内部状态快照）。
-- **日志 (`internal/logging`)**: 观察者模式实现，监听工作区事件并写入 `.filename.log` 文件，处理会话分隔。
-- **文件系统辅助 (`internal/fs`)**: 负责确定性的 `dir-tree` 输出。
-- **事件 (`internal/events`)**: 工作区和日志模块共享的轻量级事件总线。
+## 系统架构
 
-### 设计亮点
-- **观察者模式**: `events.Bus` 在命令完成时通知 `logging.Manager`，保持日志解耦。
-- **命令 + 备忘录模式**: 每个编辑器变更捕获前后快照，实现撤销/重做而不泄露缓冲区内部结构。
-- **防御性工作区**: 所有文件路径解析为绝对路径，保存时自动创建目录，通过 `SaveDecider` 抽象提示。
-- **状态持久化**: `.editor_workspace` 记录打开的文件、活动编辑器、修改标志和日志开关，满足重启要求。
+```Mermaid
+graph TD
+    CLI[cli.Dispatcher] -->|commands & queries| WS[workspace.Workspace]
 
-### 支持的命令
-`load`, `save [file|all]`, `init <file> [with-log]`, `close [file]`, `edit <file>`, `editor-list`, `dir-tree [path]`, `undo`, `redo`, `exit`, `append "text"`, `insert <line:col> "text"`, `delete <line:col> <len>`, `replace <line:col> <len> "text"`, `show [start:end]`, `log-on [file]`, `log-off [file]`, `log-show [file]`.
+    subgraph Workspace Core
+        WS --> TextEd[editor.TextEditor]
+        WS --> XMLEd[editor.XMLEditor]
+        WS --> Stats[statistics.Tracker]
+        WS --> Keeper[workspace.StateKeeper]
+    end
 
-![CommandList](img/command.jpg)
+    subgraph XML Extensions
+        XMLEd --> Spell[spellcheck.Service]
+    end
 
-### 使用方法
-```bash
-# 安装依赖
-go mod tidy
+    subgraph Event System
+        Bus[events.Bus] -->|Observer| Log[logging.Manager]
+        WS -.-> Bus
+    end
 
-# 运行交互式编辑器
-go run .
-
-# 运行各层测试
-go test ./...
+    style CLI fill:#f9f,stroke:#333,stroke-width:2px
+    style WS fill:#bbf,stroke:#333,stroke-width:2px
 ```
 
-### 测试结果
+````
 
-__自动化测试__
+| 模块                     | 责任                                     | 依赖关系                                                       |
+| ------------------------ | ---------------------------------------- | -------------------------------------------------------------- |
+| `src/cli`                | 解析命令、提供提示界面，分发到工作区     | 依赖 `workspace`、`logging`                                    |
+| `src/workspace`          | 协调编辑器、统计、拼写和日志；持久化状态 | 依赖 `editor`、`statistics`、`spellcheck`、`logging`、`events` |
+| `src/editor/text_editor` | 文本缓冲区及撤销/重做                    | 纯内存实现                                                     |
+| `src/editor/xml_editor`  | DOM 树编辑、XML 序列化、撤销/重做        | 使用组合模式维护树，依赖 `encoding/xml`                        |
+| `src/statistics`         | 会话级计时与结果格式化                   | 独立模块，被 `workspace` 和 `cli` 使用                         |
+| `src/spellcheck`         | 拼写检查服务及默认词库                   | 通过接口隔离第三方依赖，可替换实现                             |
+| `src/logging`            | 监听命令事件写入 `.name.log`             | 订阅 `events.Bus`                                              |
+| `src/events`             | 简单观察者总线                           | 被工作区与日志共享                                             |
+| `src/fs`                 | `dir-tree` 目录渲染                      | 独立工具                                                       |
 
-![testResult](img/testResult.jpg)
+## 核心设计与模式
 
-__用户测试__
+- **编辑器多态**：`editor.Editor` 抽象统一了文本与 XML 编辑器；CLI 在运行时按需求断言 `TextDocument` / `XMLTreeEditor` 能力。
+- **XML 编辑器**：
+  - 组合模式维护 DOM 树与 `id → node` 索引。
+  - 命令模式 + 快照实现撤销/重做。
+  - 解析时阻止混合内容，保存时生成 UTF-8 XML，根属性 `log="true"` 自动触发日志。
+- **统计模块**：
+  - 观察者式 `workspace.setActive` 触发 `statistics.Tracker.Switch`，会话结束或关闭文件时刷新。
+  - `statistics.FormatDuration` 按实验规范输出“秒/分钟/小时/天”。
+- **拼写检查模块**：
+  - 通过 `spellcheck.Checker` 接口隔离第三方依赖。本实现内嵌轻量词典 + Levenshtein 距离（适配器位置，可替换为语言工具 API）。
+  - `Service` 针对文本行与 XML 文本节点分别输出问题列表。
+- **横切功能整合**：`workspace.Workspace` 注入 `statistics`、`spellcheck`、`logging`，并在 `Persist` 时统一刷新状态。
 
-![useCase](img/useCase1.jpg)
-![useCase](img/useCase2.jpg)
-![useCase](img/useCase3.jpg)
-![useCase](img/useCase4.jpg)
-![useCase](img/useCase5.jpg)
+## 命令清单
+
+- **保持不变**：Lab1 的全部 18 条文本命令与日志控制命令。
+- **修改**：
+  - `init <text|xml> <file> [with-log]`：支持选择文本/默认 XML 根结构。
+  - `editor-list`：输出 `* name [modified] (2小时15分钟)`，会话时长来自统计模块。
+- **新增**：
+  - XML 编辑：`insert-before`、`append-child`、`edit-id`、`edit-text`、`delete-element`、`xml-tree [file]`
+  - 拼写检查：`spell-check [file]` （文本 & XML 文本节点）
+
+## 运行说明
+
+- **环境**：Go 1.22.5，UTF-8 文件编码。
+- **依赖安装**：`go mod tidy`
+- **运行程序**：`go run .`
+- **执行全部测试**：`go test ./...`
+- **二进制**：仓库提供 `editor.exe`（Windows）供直接体验。
+
+## 测试说明
+
+| 测试文件                            | 关注点                            |
+| ----------------------------------- | --------------------------------- |
+| `tests/editor/xml_editor_test.go`   | XML 插入/删除/撤销、树形打印      |
+| `tests/statistics/tracker_test.go`  | 计时切换、格式化边界              |
+| `tests/spellcheck/service_test.go`  | 文本与 XML 拼写报告               |
+| `tests/cli/dispatcher_test.go`      | 命令分发回归（load、editor-list） |
+| `tests/workspace/workspace_test.go` | 多文件切换、持久化、关闭逻辑      |
+
+所有测试均在 Windows 下通过：
+
+```bash
+go test ./...
+````
+
+输出 `ok softwaredesign/tests/...`，覆盖新增模块与命令主要路径。
+
+## 相比 Lab1 的增强
+
+- 引入 `editor.Editor` 多态层，实现文本/DOM 编辑器共存。
+- `workspace` 集成统计与拼写服务，并通过依赖注入保持可替换性。
+- CLI 增加 XML 专属命令与拼写检查输出，列表展示会话时长。
+- 新增文档化测试覆盖 XML、统计、拼写三大增量模块。

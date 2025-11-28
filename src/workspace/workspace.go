@@ -12,6 +12,8 @@ import (
 	"softwaredesign/src/events"
 	"softwaredesign/src/fs"
 	"softwaredesign/src/logging"
+	"softwaredesign/src/spellcheck"
+	"softwaredesign/src/statistics"
 )
 
 // SaveDecider asks user whether to save modifications.
@@ -25,12 +27,13 @@ type Info struct {
 	Name     string
 	Modified bool
 	Active   bool
+	Duration time.Duration
 }
 
 // Workspace coordinates editors, persistence, and observers.
 type Workspace struct {
 	baseDir string
-	editors map[string]*editor.TextEditor
+	editors map[string]editor.Editor
 	active  string
 	history []string
 
@@ -38,17 +41,21 @@ type Workspace struct {
 	keeper  *StateKeeper
 	logger  *logging.Manager
 	decider SaveDecider
+	stats   *statistics.Tracker
+	speller *spellcheck.Service
 }
 
 // NewWorkspace builds a workspace.
 func NewWorkspace(baseDir string, bus *events.Bus, keeper *StateKeeper, logger *logging.Manager, decider SaveDecider) *Workspace {
 	return &Workspace{
 		baseDir: baseDir,
-		editors: map[string]*editor.TextEditor{},
+		editors: map[string]editor.Editor{},
 		bus:     bus,
 		keeper:  keeper,
 		logger:  logger,
 		decider: decider,
+		stats:   statistics.NewTracker(),
+		speller: spellcheck.NewService(spellcheck.NewSimpleChecker()),
 	}
 }
 
@@ -57,13 +64,23 @@ func (w *Workspace) SetDecider(decider SaveDecider) {
 	w.decider = decider
 }
 
+// SetSpellService overrides the spell check service (used in tests).
+func (w *Workspace) SetSpellService(service *spellcheck.Service) {
+	w.speller = service
+}
+
+// SetClock overrides the tracker clock for deterministic testing.
+func (w *Workspace) SetClock(clock statistics.Clock) {
+	w.stats.WithClock(clock)
+}
+
 // BaseDir exposes the root directory.
 func (w *Workspace) BaseDir() string {
 	return w.baseDir
 }
 
 // Load opens or activates a file.
-func (w *Workspace) Load(path string) (*editor.TextEditor, error) {
+func (w *Workspace) Load(path string) (editor.Editor, error) {
 	abs, err := w.resolvePath(path)
 	if err != nil {
 		return nil, err
@@ -72,35 +89,58 @@ func (w *Workspace) Load(path string) (*editor.TextEditor, error) {
 		w.setActive(abs)
 		return ed, nil
 	}
-	lines := []string{}
-	modified := false
-	info, err := os.Stat(abs)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			modified = true
+	ext := strings.ToLower(filepath.Ext(abs))
+	var ed editor.Editor
+	switch ext {
+	case ".xml":
+		info, statErr := os.Stat(abs)
+		if statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				return nil, fmt.Errorf("XML 文件不存在: %s", abs)
+			}
+			return nil, statErr
+		}
+		if info.IsDir() {
+			return nil, fmt.Errorf("无法打开目录: %s", abs)
+		}
+		data, readErr := os.ReadFile(abs)
+		if readErr != nil {
+			return nil, readErr
+		}
+		parsed, parseErr := editor.ParseXMLEditor(abs, data)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		ed = parsed
+	default:
+		lines := []string{}
+		modified := false
+		info, statErr := os.Stat(abs)
+		if statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				modified = true
+			} else {
+				return nil, statErr
+			}
+		} else if info.IsDir() {
+			return nil, fmt.Errorf("无法打开目录: %s", abs)
 		} else {
-			return nil, err
+			data, readErr := os.ReadFile(abs)
+			if readErr != nil {
+				return nil, readErr
+			}
+			lines = splitLines(string(data))
 		}
-	} else if info.IsDir() {
-		return nil, fmt.Errorf("无法打开目录: %s", abs)
-	} else {
-		data, err := os.ReadFile(abs)
-		if err != nil {
-			return nil, err
-		}
-		lines = splitLines(string(data))
+		ed = editor.NewTextEditor(abs, lines, modified)
 	}
-	ed := editor.NewTextEditor(abs, lines, modified)
 	w.editors[abs] = ed
 	w.setActive(abs)
-	if len(lines) > 0 && strings.TrimSpace(lines[0]) == "# log" {
-		_ = w.logger.Enable(abs)
-	}
+	w.applyAutoLog(ed)
 	return ed, nil
 }
 
 // Init creates an unsaved buffer.
-func (w *Workspace) Init(path string, withLog bool) (*editor.TextEditor, error) {
+func (w *Workspace) Init(kind, path string, withLog bool) (editor.Editor, error) {
 	abs, err := w.resolvePath(path)
 	if err != nil {
 		return nil, err
@@ -108,11 +148,20 @@ func (w *Workspace) Init(path string, withLog bool) (*editor.TextEditor, error) 
 	if _, err := os.Stat(abs); err == nil {
 		return nil, fmt.Errorf("文件已存在: %s", abs)
 	}
-	lines := []string{}
-	if withLog {
-		lines = []string{"# log"}
+	var ed editor.Editor
+	switch strings.ToLower(kind) {
+	case "text":
+		lines := []string{}
+		if withLog {
+			lines = []string{"# log"}
+		}
+		ed = editor.NewTextEditor(abs, lines, true)
+	case "xml":
+		root := editor.NewDefaultXMLDocument(withLog)
+		ed = editor.NewXMLEditor(abs, root, true)
+	default:
+		return nil, fmt.Errorf("未知的编辑器类型: %s", kind)
 	}
-	ed := editor.NewTextEditor(abs, lines, true)
 	w.editors[abs] = ed
 	w.setActive(abs)
 	if withLog {
@@ -174,9 +223,9 @@ func (w *Workspace) Close(path string) error {
 		return fmt.Errorf("文件未打开: %s", target)
 	}
 	if ed.IsModified() && w.decider != nil {
-		save, err := w.decider.ConfirmSave(abs)
-		if err != nil {
-			return err
+		save, decErr := w.decider.ConfirmSave(abs)
+		if decErr != nil {
+			return decErr
 		}
 		if save {
 			if err := w.saveEditor(ed); err != nil {
@@ -185,14 +234,18 @@ func (w *Workspace) Close(path string) error {
 			ed.SetModified(false)
 		}
 	}
+	w.stats.Close(abs)
 	delete(w.editors, abs)
 	w.removeFromHistory(abs)
+	next := ""
 	if w.active == abs {
-		w.active = ""
 		if len(w.history) > 0 {
-			w.active = w.history[0]
+			next = w.history[0]
 		}
+	} else {
+		next = w.active
 	}
+	w.setActive(next)
 	return nil
 }
 
@@ -218,6 +271,7 @@ func (w *Workspace) List() []Info {
 			Name:     ed.Name(),
 			Modified: ed.IsModified(),
 			Active:   path == w.active,
+			Duration: w.stats.Duration(path),
 		})
 	}
 	return result
@@ -251,7 +305,7 @@ func (w *Workspace) Redo() error {
 }
 
 // ActiveEditor returns the current editor.
-func (w *Workspace) ActiveEditor() (*editor.TextEditor, error) {
+func (w *Workspace) ActiveEditor() (editor.Editor, error) {
 	if w.active == "" {
 		return nil, errors.New("没有活动文件")
 	}
@@ -262,10 +316,64 @@ func (w *Workspace) ActiveEditor() (*editor.TextEditor, error) {
 	return ed, nil
 }
 
+// EditorByPath returns an opened editor by path.
+func (w *Workspace) EditorByPath(path string) (editor.Editor, error) {
+	abs, err := w.resolvePath(path)
+	if err != nil {
+		return nil, err
+	}
+	ed, ok := w.editors[abs]
+	if !ok {
+		return nil, fmt.Errorf("文件未打开: %s", path)
+	}
+	return ed, nil
+}
+
+// SpellCheck runs the configured spell checker on the target file.
+func (w *Workspace) SpellCheck(path string) (string, error) {
+	if w.speller == nil {
+		return "", errors.New("未配置拼写检查器")
+	}
+	target := path
+	if target == "" {
+		target = w.active
+	}
+	if target == "" {
+		return "", errors.New("没有活动文件")
+	}
+	abs, err := w.resolvePath(target)
+	if err != nil {
+		return "", err
+	}
+	ed, ok := w.editors[abs]
+	if !ok {
+		return "", fmt.Errorf("文件未打开: %s", target)
+	}
+	switch doc := ed.(type) {
+	case editor.TextDocument:
+		issues := w.speller.CheckLines(doc.Lines())
+		return formatTextIssues(issues), nil
+	case editor.XMLTreeEditor:
+		raw := doc.TextNodes()
+		entries := make([]spellcheck.XMLText, len(raw))
+		for i, entry := range raw {
+			entries[i] = spellcheck.XMLText{ElementID: entry.ElementID, Text: entry.Text}
+		}
+		issues := w.speller.CheckXMLText(entries)
+		return formatXMLIssues(issues), nil
+	default:
+		return "", errors.New("当前文件不支持拼写检查")
+	}
+}
+
 // PublishCommand notifies observers about a command.
 func (w *Workspace) PublishCommand(name, raw, file string) {
 	if w.bus == nil {
 		return
+	}
+	metadata := map[string]string{}
+	if w.active != "" {
+		metadata["active"] = w.active
 	}
 	w.bus.Publish(events.Event{
 		Type:      events.EventCommandExecuted,
@@ -273,6 +381,7 @@ func (w *Workspace) PublishCommand(name, raw, file string) {
 		Command:   name,
 		Raw:       raw,
 		File:      file,
+		Metadata:  metadata,
 	})
 }
 
@@ -288,6 +397,7 @@ func (w *Workspace) Persist() error {
 		})
 	}
 	state.Logging = w.logger.ActivePaths()
+	w.stats.StopAll()
 	return w.keeper.Save(state)
 }
 
@@ -301,11 +411,11 @@ func (w *Workspace) Restore() error {
 		return err
 	}
 	for _, entry := range state.Editors {
-		if _, err := os.Stat(entry.Path); err != nil {
+		if _, statErr := os.Stat(entry.Path); statErr != nil {
 			continue
 		}
-		ed, err := w.Load(entry.Path)
-		if err != nil {
+		ed, loadErr := w.Load(entry.Path)
+		if loadErr != nil {
 			continue
 		}
 		ed.SetModified(entry.Modified)
@@ -331,11 +441,21 @@ func (w *Workspace) resolvePath(path string) (string, error) {
 }
 
 func (w *Workspace) setActive(path string) {
+	prev := w.active
+	if prev == path {
+		return
+	}
 	w.active = path
-	w.touchHistory(path)
+	w.stats.Switch(prev, path)
+	if path != "" {
+		w.touchHistory(path)
+	}
 }
 
 func (w *Workspace) touchHistory(path string) {
+	if path == "" {
+		return
+	}
 	w.removeFromHistory(path)
 	w.history = append([]string{path}, w.history...)
 }
@@ -350,12 +470,70 @@ func (w *Workspace) removeFromHistory(path string) {
 	w.history = next
 }
 
-func (w *Workspace) saveEditor(ed *editor.TextEditor) error {
+func (w *Workspace) saveEditor(ed editor.Editor) error {
 	if err := os.MkdirAll(filepath.Dir(ed.Path()), 0o755); err != nil {
 		return err
 	}
-	content := strings.Join(ed.Lines(), "\n")
+	content, err := ed.Content()
+	if err != nil {
+		return err
+	}
 	return os.WriteFile(ed.Path(), []byte(content), 0o644)
+}
+
+func (w *Workspace) applyAutoLog(ed editor.Editor) {
+	switch doc := ed.(type) {
+	case editor.TextDocument:
+		lines := doc.Lines()
+		if len(lines) > 0 && strings.TrimSpace(lines[0]) == "# log" {
+			_ = w.logger.Enable(ed.Path())
+		}
+	case editor.XMLTreeEditor:
+		attrs := doc.RootAttributes()
+		if strings.EqualFold(attrs["log"], "true") {
+			_ = w.logger.Enable(ed.Path())
+		}
+	}
+}
+
+func formatTextIssues(issues []spellcheck.TextIssue) string {
+	var builder strings.Builder
+	builder.WriteString("拼写检查结果:\n")
+	if len(issues) == 0 {
+		builder.WriteString("未发现拼写错误")
+		return builder.String()
+	}
+	for i, issue := range issues {
+		suggestions := "无"
+		if len(issue.Suggestions) > 0 {
+			suggestions = strings.Join(issue.Suggestions, ", ")
+		}
+		builder.WriteString(fmt.Sprintf("第%d行，第%d列: \"%s\" -> 建议: %s", issue.Line, issue.Column, issue.Word, suggestions))
+		if i != len(issues)-1 {
+			builder.WriteString("\n")
+		}
+	}
+	return builder.String()
+}
+
+func formatXMLIssues(issues []spellcheck.XMLIssue) string {
+	var builder strings.Builder
+	builder.WriteString("拼写检查结果:\n")
+	if len(issues) == 0 {
+		builder.WriteString("未发现拼写错误")
+		return builder.String()
+	}
+	for i, issue := range issues {
+		suggestions := "无"
+		if len(issue.Suggestions) > 0 {
+			suggestions = strings.Join(issue.Suggestions, ", ")
+		}
+		builder.WriteString(fmt.Sprintf("元素 %s: \"%s\" -> 建议: %s", issue.ElementID, issue.Word, suggestions))
+		if i != len(issues)-1 {
+			builder.WriteString("\n")
+		}
+	}
+	return builder.String()
 }
 
 func splitLines(data string) []string {
