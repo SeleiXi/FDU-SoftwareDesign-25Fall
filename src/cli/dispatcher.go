@@ -299,7 +299,11 @@ func (d *Dispatcher) execute(raw string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		textArg := optionalText(len(args) == 4, args[3])
+		var textArg *string
+		if len(args) == 4 {
+			val := args[3]
+			textArg = &val
+		}
 		if err := doc.InsertBefore(args[0], args[1], args[2], textArg); err != nil {
 			return false, err
 		}
@@ -313,7 +317,11 @@ func (d *Dispatcher) execute(raw string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		textArg := optionalText(len(args) == 4, args[3])
+		var textArg *string
+		if len(args) == 4 {
+			val := args[3]
+			textArg = &val
+		}
 		if err := doc.AppendChild(args[0], args[1], args[2], textArg); err != nil {
 			return false, err
 		}
