@@ -168,7 +168,7 @@ func collectSuggestions(word string, dictionary map[string]struct{}) []string {
 	}
 	var candidates []candidate
 	for dictWord := range dictionary {
-		dist := levenshtein(word, dictWord)
+		dist := localLevenshtein(word, dictWord)
 		if dist <= 2 {
 			candidates = append(candidates, candidate{word: dictWord, dist: dist})
 		}
@@ -190,7 +190,7 @@ func collectSuggestions(word string, dictionary map[string]struct{}) []string {
 	return result
 }
 
-func levenshtein(a, b string) int {
+func localLevenshtein(a, b string) int {
 	ar := []rune(a)
 	br := []rune(b)
 	if len(ar) == 0 {
