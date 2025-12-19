@@ -55,7 +55,7 @@ func NewWorkspace(baseDir string, bus *events.Bus, keeper *StateKeeper, logger *
 		logger:  logger,
 		decider: decider,
 		stats:   statistics.NewTracker(),
-		speller: spellcheck.NewService(spellcheck.NewSimpleChecker()),
+		speller: spellcheck.NewService(spellcheck.NewLanguageToolAdapter()),
 	}
 }
 
